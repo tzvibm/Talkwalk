@@ -6,7 +6,7 @@
 
 ## Table of Contents
 
-1. [Why Not RecAI](#1-why-not-recai)
+1. [Why TalkWalk](#1-why-talkwalk)
 2. [Core Architecture](#2-core-architecture)
 3. [Technical Deep Dive](#3-technical-deep-dive)
 4. [Inference Flow](#4-inference-flow)
@@ -19,23 +19,27 @@
 
 ---
 
-## 1. Why Not RecAI
+## 1. Why TalkWalk
 
-| Dimension | TalkWalk | RecAI |
+Traditional recommendation systems treat language and items as separate worlds — the user speaks English, a pipeline translates that into filters and queries, and a separate model ranks results. The user has no real control over *how* the algorithm thinks.
+
+**TalkWalk unifies language and items inside a single model.** When a user says "something chill," it doesn't trigger a filter — it directly shifts the probability distribution over items toward low-energy, relaxed content. The words *are* the algorithm.
+
+### What makes this innovative
+
+| | Traditional Recommenders | TalkWalk |
 |---|---|---|
-| **Architecture** | Single unified model — the LLM *is* the recommender | 7 loosely-coupled components — LLM orchestrates external tools |
-| **NL Steering** | Changes inference path directly (token probabilities shift) | LLM picks different tools / parameters |
-| **Latency** | One forward pass | 2+ API calls + tool execution chain |
-| **Item Understanding** | Deep — contrastively trained on metadata | Shallow — items are SQL rows the LLM never "sees" |
-| **Cold Start** | Metadata alone is enough | Needs interaction history for collaborative filtering |
-| **Scalability** | Semantic IDs = fixed vocab for millions of items | Candidate Bus initialized with all items (doesn't scale) |
-| **Code Quality** | Fresh, modern stack | Rotting deps (LangChain 0.0.312, vLLM 0.2.7, alpha UniRec) |
+| **Steering** | Filters, sliders, thumbs up/down | Plain English changes inference path in real-time |
+| **Architecture** | Pipeline of separate components (retrieval -> ranking -> re-ranking) | Single unified model — the LLM *is* the recommender |
+| **Item understanding** | Collaborative filtering on interaction history | Contrastively trained on metadata — understands what items *are* |
+| **Cold start** | Needs interaction history | Metadata alone is enough — new items work immediately |
+| **Latency** | Multiple model calls + database queries | One forward pass |
+| **Scalability** | Item IDs grow linearly with catalog | Semantic IDs = fixed vocabulary for millions of items |
+| **State** | Stateless or shallow session tracking | Deep stateful traversal — the model sees the full arc of exploration |
 
-**Verdict: Build from scratch. Steal ideas, not code.**
+### The core insight
 
-Ideas worth borrowing:
-- RL reward function design (item-level + list-level compliance + KL penalty) from RecLM-gen
-- Critique training data format from Google's REGEN dataset
+By contrastively training metadata descriptions into the LLM's embedding space, and representing items as hierarchical semantic tokens in the LLM's vocabulary, we create a system where **human language and item identity exist in the same space**. Steering the algorithm is as natural as talking to it.
 
 ---
 
