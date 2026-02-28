@@ -271,7 +271,7 @@ This creates a unified embedding space where:
 
 ### 3.2 Phase 2: Projection Training
 
-**Goal:** Train a lightweight projection that maps the LLM's hidden state into the contrastive embedding space.
+**Goal:** Train a lightweight projection that maps the LLM's hidden state into the contrastive embedding space — while solving three geometric problems that naive projection would create.
 
 The LLM (Qwen3-8B or similar) processes the conversation and produces a hidden state — a rich representation of the user's intent, context, and preferences. We need to project that hidden state into the contrastive space where item embeddings live, so we can do a nearest-neighbor lookup.
 
@@ -293,20 +293,122 @@ class ProjectionHead(nn.Module):
 proj = ProjectionHead(llm_dim=4096, contrastive_dim=512)
 ```
 
-**Training:**
-- Freeze the LLM entirely
-- Train only the projection head
-- Training data: (conversation context, target item embedding) pairs
-- Loss: cosine similarity between projected hidden state and target item's contrastive embedding
-- This is tiny — a few thousand parameters, trains in minutes
+#### The Geometric Problems
 
-**Why this works:** The LLM's hidden state already encodes rich understanding of the conversation — what the user wants, what they've seen, what they're steering toward. The projection just learns to translate that understanding into the coordinate system where items live. The heavy lifting was done in Phase 1 (contrastive training) and by the LLM's pre-training.
+A naive projection (just cosine similarity loss against target items) will fail in subtle ways. The problems are not structural — they are geometric.
+
+**Problem 1 — Hidden State Drift.** LLM hidden states are not naturally linear preference vectors. When a user says "more energetic," the hidden state does not move along a clean "energy axis." It moves along a messy mixture of syntax, discourse state, conversational memory, politeness patterns, and reasoning traces. The projection must learn to extract *only* the preference component. Otherwise steering becomes noisy.
+
+**Problem 2 — Projection Collapse.** Without constraints, the projection learns shortcuts: similar conversations map to the same embedding region, regardless of intent differences. You get good first recommendations but weak controllability. This is the most common failure mode in LLM-to-embedding projection systems.
+
+**Problem 3 — Clustered Contrastive Space.** The contrastive space from Phase 1 is trained on similarity (InfoNCE), not continuity. Recommendation requires continuous preference gradients (calm -> mellow -> balanced -> upbeat -> intense). If embeddings form isolated clusters instead of smooth gradients, steering feels jumpy — small changes in language cause large jumps in recommendations.
+
+#### The Training Objectives (5 Losses)
+
+These are lightweight additions to the projection training, not redesigns. Together they solve all three geometric problems.
+
+**Loss 1 — Target Similarity (baseline).** Standard cosine similarity between projected hidden state and target item embedding:
+
+```
+L_target = 1 - cosine(projection(H), target_item_embedding)
+```
+
+**Loss 2 — Directional Steering (solves Problem 1, most important).** Explicitly teaches that language edits correspond to vector directions in contrastive space.
+
+Create paired training examples where the only difference is a steering utterance:
+
+```
+C1: "recommend something chill"           --> H1
+C2: "recommend something more energetic"  --> H2
+```
+
+Compute the expected direction from metadata:
+```
+delta_target = embedding(energetic_items) - embedding(chill_items)
+delta_model  = projection(H2) - projection(H1)
+```
+
+Loss:
+```
+L_direction = 1 - cosine(delta_model, delta_target)
+```
+
+This teaches: "more energetic" means move *this way* in contrastive space. Steering becomes linear and predictable. This single loss dramatically improves controllability.
+
+**Loss 3 — Anchor Reconstruction (solves Problem 2).** Forces projected hidden states to remain semantically interpretable, preventing projection collapse.
+
+After projection, a small decoder reconstructs the metadata description text embedding:
+
+```
+z = projection(hidden_state)
+reconstructed = decoder(z)
+L_reconstruct = 1 - cosine(reconstructed, text_encoder(metadata_description))
+```
+
+The projection cannot memorize conversations — it must encode semantic intent to reconstruct descriptions. This keeps the projection honest.
+
+**Loss 4 — Conversation Delta (high ROI).** Instead of training only on final targets, also train on turn-to-turn transitions.
+
+```
+Turn 1 --> item A
+Turn 2 ("more upbeat") --> item B
+
+L_delta = margin_loss(
+    projection(H2) closer to B than A,
+    projection(H1) closer to A than B
+)
+```
+
+This directly teaches conversational steering dynamics — the projection learns how turns change recommendations, not just what the final answer should be.
+
+**Loss 5 — Context Dropout (quiet but critical).** Long conversations can dominate hidden states, making the projection position-dependent rather than meaning-dependent.
+
+During projection training, randomly:
+- Drop earlier turns from context
+- Shuffle irrelevant history
+- Vary metadata verbosity
+
+This forces the projection to rely on semantic meaning, not prompt position. Result: robust steering even after long sessions.
+
+#### Combined Training Loss
+
+```
+L = L_target + alpha * L_direction + beta * L_reconstruct + gamma * L_delta
+```
+
+With context dropout applied stochastically during training. The LLM is frozen throughout — only the projection head and small decoder are trained.
+
+Suggested starting weights: alpha=1.0, beta=0.5, gamma=0.5. The directional steering loss is the most important; start there and add the others incrementally.
 
 **Base model:** Qwen3-8B (or any open-source LLM)
 - Best embedding quality at 7-8B size
 - Apache 2.0 / permissive license
 - No vocabulary extension needed — the model stays as-is
-- No fine-tuning needed — only the projection head is trained
+- No fine-tuning needed — only the projection head and decoder are trained
+
+---
+
+### 3.3 Contrastive Space Smoothing (Phase 1 Addition)
+
+Phase 1's InfoNCE loss teaches similarity but not continuity. To create smooth preference gradients in the contrastive space, add synthetic interpolation training.
+
+Take two metadata profiles at different points on an axis:
+```
+energy = 0.2  --> "low energy, quiet, subdued"
+energy = 0.8  --> "high energy, intense, driving"
+```
+
+Generate a midpoint description:
+```
+energy = 0.5  --> "moderately energetic, balanced intensity"
+```
+
+Train so the midpoint embedding falls between the endpoints:
+```
+L_smooth = ||E(midpoint) - 0.5 * (E(low) + E(high))||^2
+```
+
+This creates continuous axes inside the contrastive space. Without this, nearest-neighbor results jump between clusters instead of gliding along gradients. Apply this along every metadata axis that has a natural ordering (energy, tempo, valence, price, etc.).
 
 ---
 
@@ -408,7 +510,10 @@ Talkwalk/
     projection/
       __init__.py
       projection_head.py        # LLM hidden state -> contrastive space
+      anchor_decoder.py         # Small decoder for reconstruction loss
+      losses.py                 # All 5 training losses (target, directional, reconstruct, delta, dropout)
       train_projection.py       # Projection training script
+      steering_pairs.py         # Generate (base_context, steered_context) pairs for directional loss
 
     # Item index
     index/
@@ -612,14 +717,18 @@ TalkWalk's advantage is not ranking accuracy — it's controllability, interpret
 - [ ] Write MetadataEncoder
 - [ ] Write paired dataset loader (items, users, composites, cross-domain)
 - [ ] Implement symmetric InfoNCE training loop
+- [ ] Add interpolation smoothing loss for ordered metadata axes (energy, tempo, price, etc.)
 - [ ] Write human language descriptions for chosen domain (items + users + combinations)
-- [ ] Train and validate: verify that similar items/users cluster together
-- [ ] Visualize embedding space (t-SNE/UMAP)
+- [ ] Generate midpoint descriptions for smoothing
+- [ ] Train and validate: verify that similar items/users cluster together AND gradients are smooth
+- [ ] Visualize embedding space (t-SNE/UMAP) — check for continuity, not just clusters
 
-### Phase 2: Projection + Index (Week 4)
-- [ ] Embed full catalog into contrastive space
-- [ ] Build FAISS index
-- [ ] Train projection head (LLM hidden state -> contrastive space)
+### Phase 2: Projection + Index (Weeks 4-5)
+- [ ] Embed full catalog into contrastive space, build FAISS index
+- [ ] Generate steering pairs for directional loss
+- [ ] Generate conversation delta pairs for turn-transition loss
+- [ ] Train projection head with all 5 losses (target + directional + reconstruction + delta + context dropout)
+- [ ] Validate: directional steering (does "more energetic" move the right direction?)
 - [ ] Validate: given a conversation, does the projected hidden state land near the right items?
 
 ### Phase 3: Inference Engine (Week 5)
