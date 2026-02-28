@@ -95,6 +95,16 @@ At every point during inference, the probability distribution over the next sema
 
 There is no distinction between "the algorithm" and "the inputs." The distribution space *is* the algorithm, and every signal — user or system, language or embedding — continuously reshapes it. This is what makes TalkWalk fundamentally different: the recommendation algorithm is not a fixed function that takes inputs; it is a living distribution that every participant (user, system, context) is constantly sculpting.
 
+### Context Length
+
+At each inference point, the context fed to the model is:
+
+```
+[ new user text ] + [ new system text ] + [ truncated conversation history ]
+```
+
+The conversation history is truncated to a configurable maximum length (e.g. last N turns or K tokens). This bounds memory and compute regardless of session length. The truncation is not a limitation — it mirrors how recommendation relevance naturally decays over time. Recent interactions matter more than distant ones, and the contrastive embeddings already encode long-term user preferences via the system-provided user metadata. The sliding window of recent context handles short-term trajectory; the user profile handles long-term identity.
+
 ### What Makes This Novel
 
 1. **The LLM *is* the recommender** — no tool chain, no external ranker, no SQL queries
@@ -544,40 +554,43 @@ Source: Catalog items with their contrastive descriptions mapped to assigned sem
 
 ## 8. Evaluation
 
-### Ranking Metrics
+TalkWalk's advantage is not ranking accuracy — it's controllability, interpretability, and interaction efficiency. We evaluate on those axes first, with traditional metrics as a secondary sanity check.
 
-| Metric | What It Measures | Target |
-|--------|-----------------|--------|
-| Hit@10 | Ground-truth in top 10? | > 0.20 |
-| NDCG@10 | Ranking quality weighted by position | > 0.15 |
-| MRR | Avg 1/rank of first relevant item | > 0.10 |
+### Primary Metrics: Controllability
 
-### Hierarchical Accuracy
+| Metric | What It Measures | Protocol |
+|--------|-----------------|----------|
+| **Steering entropy reduction** | How much does a steering utterance narrow the output distribution? | Measure entropy of the semantic ID distribution before and after a steering input. Higher reduction = more responsive steering. |
+| **Turns-to-satisfaction** | How many turns does a user need to reach a satisfying recommendation? | Simulated and human eval: give users a target preference, count turns until the output matches. Lower is better. |
+| **Controllable diversity gradient** | Can the user smoothly control how diverse recommendations are? | User says "more variety" / "stay close" — measure the resulting spread (L1 divergence) across outputs. Should scale proportionally to steering intensity. |
+| **Steering precision** | When a user says "more X," does X increase without unrelated attributes changing? | Measure change in target attribute vs. change in non-target attributes. High precision = surgical steering. |
+| **Steering reversibility** | Can the user undo a steer? | User steers toward X, then says "go back." Measure cosine similarity of output distribution to pre-steer state. |
 
-| Metric | Target |
-|--------|--------|
-| L1 Accuracy (coarse category) | > 80% |
-| L2 Accuracy (sub-cluster) | > 50% |
-| L3 Accuracy (exact item) | > 20% |
-| Valid Format % | 100% (guaranteed by constrained decoding) |
+### Primary Metrics: Interpretability
 
-### Steerability (the differentiator)
+| Metric | What It Measures | Protocol |
+|--------|-----------------|----------|
+| **Embedding space coherence** | Do semantic ID clusters correspond to human-understandable categories? | Cluster L1 groups, label them via LLM, ask human raters if labels match cluster contents. |
+| **Steering traceability** | Can you explain *why* a recommendation changed? | Given a steer + output shift, measure whether the embedding distance between old/new output aligns with the steering direction in embedding space. |
 
-| Metric | Protocol |
-|--------|----------|
-| Constraint-following | "under $50" — does output satisfy? Target > 90% |
-| Preference sensitivity | Same history + different steering text — do outputs diverge? |
-| Attribute control | Ask for genre X — what fraction of outputs are genre X? |
-| NL instruction quality | LLM-as-judge scores coherence 1-5 |
+### Primary Metrics: Interaction Efficiency
 
-### Beyond-Accuracy
+| Metric | What It Measures | Protocol |
+|--------|-----------------|----------|
+| **First-turn relevance** | How good is the recommendation with zero steering? | User metadata + first prompt only. Measure user satisfaction (simulated or human). |
+| **Exploration velocity** | How quickly can a user traverse different regions of the catalog? | Count unique L1 clusters reached in N turns. Higher = faster exploration. |
+| **Cold-start quality** | How well does it work for a brand new user with only metadata? | Evaluate recommendations for users with no interaction history, only demographic/contextual metadata. |
 
-| Metric | What |
-|--------|------|
-| Catalog Coverage | % of catalog ever recommended (avoid popularity bias) |
-| Diversity (ILS) | How different are items within one recommendation list |
-| Novelty | Average inverse popularity of recommended items |
-| Latency | Target < 500ms per recommendation |
+### Secondary Metrics: Sanity Checks
+
+These are not the goal — they just confirm the system isn't broken:
+
+| Metric | What | Baseline |
+|--------|------|----------|
+| Valid format % | Constrained decoding produces valid semantic IDs | 100% (guaranteed) |
+| L1 accuracy | Coarse category correct | > 70% |
+| Catalog coverage | % of catalog ever recommended | > 30% |
+| Latency | Time per recommendation | < 500ms |
 
 ---
 
