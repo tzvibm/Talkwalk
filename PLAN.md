@@ -23,123 +23,112 @@
 
 Traditional recommendation systems treat language and items as separate worlds — the user speaks English, a pipeline translates that into filters and queries, and a separate model ranks results. The user has no real control over *how* the algorithm thinks.
 
-TalkWalk unifies language and items inside a single model. When a user says "something chill," it doesn't trigger a filter — it directly shifts the probability distribution over items toward low-energy, relaxed content. The words *are* the algorithm.
+TalkWalk unifies language and items inside a single embedding space. When a user says "something chill," it doesn't trigger a filter — it encodes directly into the same space where items live, landing near low-energy, relaxed content. The words *are* the coordinates.
 
 | | Traditional Recommenders | TalkWalk |
 |---|---|---|
-| **Steering** | Filters, sliders, thumbs up/down | Plain English changes inference path in real-time |
-| **Architecture** | Pipeline of separate components (retrieval, ranking, re-ranking) | Single model infers in language space; contrastive embeddings resolve to items |
+| **Steering** | Filters, sliders, thumbs up/down | Plain English changes the query point in embedding space in real-time |
+| **Architecture** | Pipeline of separate components (retrieval, ranking, re-ranking) | One shared contrastive space — all signals encode into it, nearest neighbor resolves to items |
 | **Item understanding** | Collaborative filtering on interaction history | Contrastively trained on metadata — understands what items *are* |
 | **User understanding** | Demographic buckets, sparse features | User metadata contrastively trained with language descriptions — understands who users *are* |
 | **Cold start** | Needs interaction history | Metadata alone is enough — new items and new users work immediately |
-| **Latency** | Multiple model calls + database queries | One forward pass + one nearest-neighbor lookup |
+| **Latency** | Multiple model calls + database queries | Encode + nearest-neighbor lookup |
 | **Scalability** | Item IDs grow linearly with catalog | Contrastive space is fixed-dimensional regardless of catalog size |
-| **State** | Stateless or shallow session tracking | Implicit — the conversation context *is* the traversal |
 
 ### The core insight
 
-The LLM should never know about item IDs. It should stay entirely in language space — understanding user intent, maintaining conversational context, reasoning about what to recommend. The contrastive embedding space, trained to align metadata and language, handles the translation from "what the user wants" to "which specific item that is." Inference and ID resolution are completely decoupled.
+We contrastively train item metadata, user metadata, combined profiles, and natural language descriptions all into the same embedding space. At inference, every signal — user text, system-provided user profile, system-provided context — encodes directly into that space. The query point for nearest-neighbor search is the combination of all these embeddings. No projection head. No LLM hidden state extraction. Everything is already in the same space because that's what Phase 1 trained for.
+
+An LLM can optionally sit on top as a reasoning layer — processing multi-turn conversation and generating a text description of what to recommend. That description goes through the same text encoder into the same contrastive space. The LLM is a convenience for complex reasoning, not a structural requirement.
 
 ---
 
 ## 2. Core Architecture
 
-### The Two-Space Design
+### One Space
 
 ```
-LANGUAGE SPACE (the LLM)              CONTRASTIVE SPACE (the bridge)
+Everything encodes into the same contrastive embedding space:
 
-User text + system text               Item metadata embeddings
-       |                               User metadata embeddings
-       v                               Language description embeddings
-LLM reasons in natural language              |
-       |                                     |
-       v                                     v
-Hidden state / generated description   All live in the same vector space
-       |                                     |
-       '----- projection ------->  nearest neighbor lookup
-                                             |
-                                             v
-                                       Real item ID
+  User text:        "something chill"            --> text_encoder    --> [0.08, -0.52, ...]
+  User metadata:    {age: 25, freq: power}       --> metadata_encoder --> [0.15, -0.41, ...]
+  System context:   {time: late_night, ...}      --> metadata_encoder --> [0.03, -0.60, ...]
+  Item metadata:    {genre: jazz, energy: 0.2}   --> metadata_encoder --> [0.08, -0.52, ...]
+  Item description: "relaxed jazz, low energy"   --> text_encoder    --> [0.09, -0.50, ...]
+
+All vectors live in the same space. Similarity = relevance.
 ```
 
-The LLM stays in language. The contrastive space does ID resolution. They are decoupled.
-
-### Training Pipeline
+### Training
 
 ```
-Phase 1                              Phase 2
-Contrastive Pre-training         --> Projection Training
-(item metadata <-> text)              (LLM hidden state -> contrastive space)
-(user metadata <-> text)              lightweight linear projection
-(composites   <-> text)
-OpenCLIP + InfoNCE
+Phase 1: Contrastive Pre-training
+  - Item metadata <-> item descriptions
+  - User metadata <-> user descriptions
+  - Composite metadata <-> composite descriptions
+  - User x Item affinity pairs
+  - Interpolation smoothing along ordered axes
+  - All into one shared embedding space
+  OpenCLIP + InfoNCE
 ```
 
-No quantization. No vocabulary extension. No semantic IDs. No constrained decoding.
+That's it. One training phase. Everything else is inference.
 
-### Inference Pipeline
+### Inference
 
 ```
-User input + user metadata
-    |
-    v
-Conversation context (all prior turns + system context)
-    |
-    v
-LLM forward pass (pure language inference)
-    |
-    v
-Extract hidden state from final layer
-    |
-    v
-Project into contrastive embedding space
-    |
-    v
-Nearest neighbor search against item catalog embeddings
-    |
-    v
-Return real item ID to client
+At each turn:
+  1. Encode user's text with text_encoder          --> user_text_emb
+  2. Encode user metadata with metadata_encoder     --> user_meta_emb
+  3. Encode system context with text/meta encoder   --> system_emb
+  4. Combine: query = f(user_text_emb, user_meta_emb, system_emb, prior_item_embs)
+  5. Nearest neighbor search against item index     --> item ID
+  6. Return item ID to client
 ```
 
-### The Key Principle: Everything Reshapes the Distribution
+No projection head. No LLM hidden state. No learned bridge between spaces. Everything is already in the same space.
 
-At every point during inference, the LLM's internal representation is shaped by everything in the context:
+### The Key Principle: Everything Reshapes the Query
 
-- **User-provided English** — "something chill," "more like that," "wake me up" — each phrase shifts the LLM's hidden state, which shifts where it lands in contrastive space
-- **System-provided user metadata embeddings** — the user's age, platform, time of day, listening history — injected into the prompt, these bias the model's reasoning toward regions that match the user's profile
-- **System-provided contextual signals** — session context, domain rules, business constraints — further shape the LLM's output
-- **Prior conversation** — every previous recommendation and user reaction is in the context window, influencing the current output
+At every point during inference, both the user and the system can inject signals that move the query point in contrastive space:
 
-There is no distinction between "the algorithm" and "the inputs." The LLM's hidden state *is* the algorithm, and every signal — user or system, language or embedding — continuously reshapes it. The contrastive space then translates that hidden state into a concrete item. This is what makes TalkWalk fundamentally different: the recommendation algorithm is not a fixed function that takes inputs; it is a living representation that every participant (user, system, context) is constantly sculpting.
+- **User-provided English** — "something chill," "more like that," "wake me up" — each phrase encodes into the space via the text encoder, shifting the query point
+- **System-provided user metadata** — the user's age, platform, time of day, listening history — encodes via the metadata encoder, biasing the query toward regions that match the user's profile
+- **System-provided contextual signals** — session context, domain rules, business constraints — encode into the same space, further shaping the query
+- **Prior recommendations** — previously returned items are already embedded; they can be used to attract (more like this) or repel (something different) the query point
+
+There is no distinction between user input and system input at the embedding level. Both are just vectors in the same space. Both reshape the query. The recommendation algorithm is not a function — it is a point in a space that every participant is constantly moving.
 
 ### Context Length
 
-At each inference point, the context fed to the model is:
+Conversation history is maintained as a list of prior embeddings (user text embeddings + returned item embeddings). At each turn, the combination function sees:
 
 ```
-[ new user text ] + [ new system text ] + [ truncated conversation history ]
+[ current user text emb ] + [ current system embs ] + [ last N item embs returned ]
 ```
 
-The conversation history is truncated to a configurable maximum length (e.g. last N turns or K tokens). This bounds memory and compute regardless of session length. The truncation is not a limitation — it mirrors how recommendation relevance naturally decays over time. Recent interactions matter more than distant ones, and the contrastive embeddings already encode long-term user preferences via the system-provided user metadata. The sliding window of recent context handles short-term trajectory; the user profile handles long-term identity.
+Bounded by a configurable window size. No LLM context window limitations. No truncation artifacts. Just a sliding window of vectors.
 
-### What Makes This Novel
+### Optional: LLM as Reasoning Layer
 
-1. **Inference is decoupled from IDs** — the LLM never generates item IDs; it reasons in pure language, and the contrastive space resolves to items separately
-2. **Every input changes the algorithm** — user English, system metadata, prior outputs — all continuously reshape the LLM's hidden state, which determines where it lands in contrastive space
-3. **No quantization artifacts** — no hierarchical commitment, no path dependence, no vocabulary extension; the contrastive space is continuous
-4. **No fine-tuning needed** — the LLM already understands language; we only train a lightweight projection from its hidden state to the contrastive space
-5. **Domain-agnostic** — works for music, products, movies, articles — anything with metadata
+For complex multi-turn steering where the text encoder alone may struggle (e.g., "something like that third song you recommended but more upbeat and less electronic"), an LLM can process the full conversation and generate a text description of the intent:
+
+```
+User conversation --> LLM --> "upbeat acoustic track similar to indie-folk"
+                              --> text_encoder --> contrastive space --> nearest neighbor
+```
+
+The LLM's output is plain text. It goes through the same text encoder as everything else. The LLM is a preprocessor, not a structural component. It can be swapped, removed, or upgraded without changing the recommendation architecture.
 
 ---
 
 ## 3. Technical Deep Dive
 
-### 3.1 Phase 1: Contrastive Pre-training (Metadata <-> Text)
+### 3.1 Phase 1: Contrastive Pre-training
 
-**Goal:** Create a shared embedding space where structured metadata and human language descriptions mean the same thing — for items, users, and their combinations.
+**Goal:** Create a single embedding space where item metadata, user metadata, combined profiles, and natural language descriptions all coexist — with smooth, continuous gradients.
 
-**Architecture:** CLIP-style dual encoder with InfoNCE loss.
+**Architecture:** CLIP-style dual encoder with InfoNCE loss + interpolation smoothing.
 
 ```python
 # Encoder A: Text (pre-trained, frozen initially)
@@ -156,11 +145,7 @@ class MetadataEncoder(nn.Module):
             nn.Linear(512, embed_dim),
         )
 
-# Loss: Symmetric InfoNCE
-# For batch of N (metadata, text) pairs:
-# - Compute NxN cosine similarity matrix
-# - Maximize diagonal (matching pairs)
-# - Minimize off-diagonal (mismatched pairs)
+# Loss: Symmetric InfoNCE + interpolation smoothing
 ```
 
 #### Item Metadata Descriptions
@@ -184,7 +169,7 @@ energy:
 
 #### User Metadata Descriptions
 
-Every user attribute gets the same treatment — human language descriptions so the model understands *who* it's recommending to, not just *what* to recommend:
+Every user attribute gets the same treatment:
 
 ```yaml
 age_range:
@@ -213,7 +198,7 @@ time_of_day:
 
 #### Combined Metadata Sets (Composite Descriptions)
 
-The real power is in combinations. Individual metadata values are useful, but behavior emerges from intersections. We train on composite descriptions that capture the *meaning* of metadata combinations:
+Behavior emerges from intersections. We train on composite descriptions that capture the *meaning* of metadata combinations:
 
 ```yaml
 age_range=18-24 + listening_frequency=power:
@@ -235,7 +220,7 @@ age_range=50+ + platform=smart_speaker + time_of_day=morning:
 
 #### Cross-Domain Training (User x Item)
 
-We also train contrastively on user-item affinity descriptions — teaching the model that certain user profiles naturally align with certain item profiles:
+We also train on user-item affinity descriptions:
 
 ```yaml
 user={age: 18-24, freq: power, time: late_night} + item={genre: ambient, energy: 0.2}:
@@ -245,178 +230,81 @@ user={age: 35-49, freq: casual} + item={genre: experimental-noise, energy: 0.9}:
   "mature casual listener vs harsh experimental — low affinity, avoid unless requested"
 ```
 
-This means when the model sees a user profile at inference time, it already knows which regions of item-space are natural fits — and which require an explicit steering request to reach.
+When the system encodes a user profile at inference time, the embedding already knows which regions of item-space are natural fits — and which require an explicit steering request to reach.
+
+#### Interpolation Smoothing
+
+InfoNCE teaches similarity but not continuity. To create smooth preference gradients, add synthetic interpolation training along every metadata axis with a natural ordering:
+
+```
+energy = 0.2  --> "low energy, quiet, subdued"
+energy = 0.5  --> "moderately energetic, balanced intensity"
+energy = 0.8  --> "high energy, intense, driving"
+
+Loss: E(midpoint) should fall between E(low) and E(high)
+L_smooth = ||E(mid) - 0.5 * (E(low) + E(high))||^2
+```
+
+Apply along energy, tempo, valence, price, age, etc. This creates continuous axes inside the space so that steering produces smooth glides, not abrupt jumps.
 
 #### Training Strategy
 
-All metadata types are trained together in the same contrastive embedding space:
+All metadata types and smoothing are trained together:
 
 ```
 Item metadata      <-- contrastive -->  Item descriptions
 User metadata      <-- contrastive -->  User descriptions
 Combined metadata  <-- contrastive -->  Composite descriptions
 User x Item pairs  <-- contrastive -->  Affinity descriptions
+Ordered axes       <-- smoothing   -->  Midpoint descriptions
 ```
-
-This creates a unified embedding space where:
-- "18-24 year old power listener" is *near* "experimental, high-discovery items"
-- "50+ casual morning listener" is *near* "familiar, moderate-energy classics"
-- Plain English steering ("show me something weird") moves through the same space
 
 **Libraries:** OpenCLIP (with MetadataEncoder replacing vision tower) + info-nce-pytorch
 
-**Output:** Dense embeddings where item metadata, user metadata, combined profiles, and natural language all live in the same vector space. Every item in the catalog has a fixed embedding vector in this space.
+**Output:** A single embedding space where item metadata, user metadata, combined profiles, and natural language all coexist with smooth gradients. Every item in the catalog gets a fixed embedding vector. This is the only training required.
 
 ---
 
-### 3.2 Phase 2: Projection Training
+### 3.2 Query Combination
 
-**Goal:** Train a lightweight projection that maps the LLM's hidden state into the contrastive embedding space — while solving three geometric problems that naive projection would create.
-
-The LLM (Qwen3-8B or similar) processes the conversation and produces a hidden state — a rich representation of the user's intent, context, and preferences. We need to project that hidden state into the contrastive space where item embeddings live, so we can do a nearest-neighbor lookup.
+At inference, multiple signals encode into the contrastive space simultaneously. The query point for nearest-neighbor search is their combination.
 
 ```python
-class ProjectionHead(nn.Module):
-    """Maps LLM hidden state to contrastive embedding space."""
-    def __init__(self, llm_dim, contrastive_dim):
-        super().__init__()
-        self.projection = nn.Sequential(
-            nn.Linear(llm_dim, contrastive_dim),
-            nn.GELU(),
-            nn.Linear(contrastive_dim, contrastive_dim),
-        )
+def build_query(user_text, user_metadata, system_context, prior_items, weights):
+    """Combine all signals into a single query point in contrastive space."""
 
-    def forward(self, hidden_state):
-        return F.normalize(self.projection(hidden_state), dim=-1)
+    # Everything encodes into the same space
+    text_emb = text_encoder(user_text)                    # what the user said
+    user_emb = metadata_encoder(user_metadata)            # who the user is
+    ctx_emb  = text_encoder(system_context)               # system-provided context
+    prior_embs = [item_index[id] for id in prior_items]   # what was already recommended
 
-# Example: Qwen3-8B has hidden_dim=4096, contrastive space is 512-dim
-proj = ProjectionHead(llm_dim=4096, contrastive_dim=512)
+    # Weighted combination
+    query = (
+        weights.text * text_emb
+      + weights.user * user_emb
+      + weights.context * ctx_emb
+    )
+
+    # Optionally repel from prior items (diversity)
+    for emb in prior_embs:
+        query = query - weights.repulsion * emb
+
+    return normalize(query)
 ```
 
-#### The Geometric Problems
+The weights control how much each signal influences the recommendation:
+- High `weights.text` = user's words dominate (strong steering)
+- High `weights.user` = profile dominates (personalization)
+- High `weights.repulsion` = avoid repeating similar items (exploration)
 
-A naive projection (just cosine similarity loss against target items) will fail in subtle ways. The problems are not structural — they are geometric.
-
-**Problem 1 — Hidden State Drift.** LLM hidden states are not naturally linear preference vectors. When a user says "more energetic," the hidden state does not move along a clean "energy axis." It moves along a messy mixture of syntax, discourse state, conversational memory, politeness patterns, and reasoning traces. The projection must learn to extract *only* the preference component. Otherwise steering becomes noisy.
-
-**Problem 2 — Projection Collapse.** Without constraints, the projection learns shortcuts: similar conversations map to the same embedding region, regardless of intent differences. You get good first recommendations but weak controllability. This is the most common failure mode in LLM-to-embedding projection systems.
-
-**Problem 3 — Clustered Contrastive Space.** The contrastive space from Phase 1 is trained on similarity (InfoNCE), not continuity. Recommendation requires continuous preference gradients (calm -> mellow -> balanced -> upbeat -> intense). If embeddings form isolated clusters instead of smooth gradients, steering feels jumpy — small changes in language cause large jumps in recommendations.
-
-#### The Training Objectives (5 Losses)
-
-These are lightweight additions to the projection training, not redesigns. Together they solve all three geometric problems.
-
-**Loss 1 — Target Similarity (baseline).** Standard cosine similarity between projected hidden state and target item embedding:
-
-```
-L_target = 1 - cosine(projection(H), target_item_embedding)
-```
-
-**Loss 2 — Directional Steering (solves Problem 1, most important).** Explicitly teaches that language edits correspond to vector directions in contrastive space.
-
-Create paired training examples where the only difference is a steering utterance:
-
-```
-C1: "recommend something chill"           --> H1
-C2: "recommend something more energetic"  --> H2
-```
-
-Compute the expected direction from metadata:
-```
-delta_target = embedding(energetic_items) - embedding(chill_items)
-delta_model  = projection(H2) - projection(H1)
-```
-
-Loss:
-```
-L_direction = 1 - cosine(delta_model, delta_target)
-```
-
-This teaches: "more energetic" means move *this way* in contrastive space. Steering becomes linear and predictable. This single loss dramatically improves controllability.
-
-**Loss 3 — Anchor Reconstruction (solves Problem 2).** Forces projected hidden states to remain semantically interpretable, preventing projection collapse.
-
-After projection, a small decoder reconstructs the metadata description text embedding:
-
-```
-z = projection(hidden_state)
-reconstructed = decoder(z)
-L_reconstruct = 1 - cosine(reconstructed, text_encoder(metadata_description))
-```
-
-The projection cannot memorize conversations — it must encode semantic intent to reconstruct descriptions. This keeps the projection honest.
-
-**Loss 4 — Conversation Delta (high ROI).** Instead of training only on final targets, also train on turn-to-turn transitions.
-
-```
-Turn 1 --> item A
-Turn 2 ("more upbeat") --> item B
-
-L_delta = margin_loss(
-    projection(H2) closer to B than A,
-    projection(H1) closer to A than B
-)
-```
-
-This directly teaches conversational steering dynamics — the projection learns how turns change recommendations, not just what the final answer should be.
-
-**Loss 5 — Context Dropout (quiet but critical).** Long conversations can dominate hidden states, making the projection position-dependent rather than meaning-dependent.
-
-During projection training, randomly:
-- Drop earlier turns from context
-- Shuffle irrelevant history
-- Vary metadata verbosity
-
-This forces the projection to rely on semantic meaning, not prompt position. Result: robust steering even after long sessions.
-
-#### Combined Training Loss
-
-```
-L = L_target + alpha * L_direction + beta * L_reconstruct + gamma * L_delta
-```
-
-With context dropout applied stochastically during training. The LLM is frozen throughout — only the projection head and small decoder are trained.
-
-Suggested starting weights: alpha=1.0, beta=0.5, gamma=0.5. The directional steering loss is the most important; start there and add the others incrementally.
-
-**Base model:** Qwen3-8B (or any open-source LLM)
-- Best embedding quality at 7-8B size
-- Apache 2.0 / permissive license
-- No vocabulary extension needed — the model stays as-is
-- No fine-tuning needed — only the projection head and decoder are trained
-
----
-
-### 3.3 Contrastive Space Smoothing (Phase 1 Addition)
-
-Phase 1's InfoNCE loss teaches similarity but not continuity. To create smooth preference gradients in the contrastive space, add synthetic interpolation training.
-
-Take two metadata profiles at different points on an axis:
-```
-energy = 0.2  --> "low energy, quiet, subdued"
-energy = 0.8  --> "high energy, intense, driving"
-```
-
-Generate a midpoint description:
-```
-energy = 0.5  --> "moderately energetic, balanced intensity"
-```
-
-Train so the midpoint embedding falls between the endpoints:
-```
-L_smooth = ||E(midpoint) - 0.5 * (E(low) + E(high))||^2
-```
-
-This creates continuous axes inside the contrastive space. Without this, nearest-neighbor results jump between clusters instead of gliding along gradients. Apply this along every metadata axis that has a natural ordering (energy, tempo, valence, price, etc.).
+These can be fixed, learned, or dynamically adjusted based on steering intensity.
 
 ---
 
 ### 3.3 Item Index
 
-**Goal:** Enable fast nearest-neighbor lookup in the contrastive space.
-
-Every item in the catalog is embedded once (via the metadata encoder from Phase 1) and stored in a vector index:
+Every item in the catalog is embedded once and stored in a vector index:
 
 ```python
 import faiss
@@ -428,9 +316,9 @@ item_embeddings = metadata_encoder(all_item_metadata)  # shape: [num_items, cont
 index = faiss.IndexFlatIP(contrastive_dim)  # inner product = cosine sim on normalized vecs
 index.add(item_embeddings)
 
-# At inference: project LLM hidden state, query index
-projected = projection_head(llm_hidden_state)
-distances, item_indices = index.search(projected, k=10)  # top-10 nearest items
+# At inference: query the index
+query = build_query(user_text, user_meta, system_ctx, prior_items, weights)
+distances, item_indices = index.search(query, k=10)  # top-10 nearest items
 ```
 
 For large catalogs (millions of items), use approximate nearest neighbor (FAISS IVF, HNSW, or ScaNN) for sub-millisecond lookup.
@@ -444,43 +332,70 @@ New items are added by embedding their metadata and inserting into the index. No
 ### Example Catalog
 
 ```
-song_042: {genre: "indie-rock", mood: "melancholic", energy: 0.3}  --> embedding [0.12, -0.45, ...]
-song_871: {genre: "electronic", mood: "euphoric", energy: 0.9}     --> embedding [0.87, 0.33, ...]
-song_215: {genre: "jazz", mood: "relaxed", energy: 0.2}            --> embedding [0.08, -0.52, ...]
+song_042: {genre: "indie-rock", mood: "melancholic", energy: 0.3}  --> emb_042
+song_871: {genre: "electronic", mood: "euphoric", energy: 0.9}     --> emb_871
+song_215: {genre: "jazz", mood: "relaxed", energy: 0.2}            --> emb_215
 ```
 
 ### Multi-Turn Conversation
 
 ```
 TURN 1:
-  System: "User profile: 25yo, prefers indie."
-  User:   "Recommend something"
-  LLM:    produces hidden state H1
-  Project: H1 --> contrastive space --> nearest neighbor --> song_042 (indie, melancholic)
-  Append to context: "Recommended: indie-rock, melancholic, low energy"
+  User text:     "recommend something"
+  User metadata: {age: 25, freq: power}
+  System:        {time: evening}
+
+  text_emb  = encode("recommend something")           --> generic, near center
+  user_emb  = encode({age: 25, freq: power})           --> leans toward discovery
+  sys_emb   = encode({time: evening})                  --> leans toward winding-down
+
+  query = combine(text_emb, user_emb, sys_emb)        --> lands near chill/discovery region
+  nearest neighbor --> song_042 (indie, melancholic)
 
 TURN 2:
-  User:   "More like that"
-  LLM:    sees prior context + "more like that" --> produces H2
-  Project: H2 --> contrastive space --> nearest to H2 but not song_042 --> song_215 (jazz, relaxed)
+  User text:     "more like that"
+  Prior items:   [song_042]
 
-  The hidden state H2 is shaped by the full context: user profile + song_042's description
-  + "more like that." It naturally lands near the same region of contrastive space.
+  text_emb  = encode("more like that")                --> generic "similar" signal
+  user_emb  = same
+  sys_emb   = same
+  prior     = [emb_042]                               --> attracts query toward emb_042's region
+
+  query = combine(text_emb, user_emb, sys_emb) + attract(emb_042)
+  nearest neighbor (excluding song_042) --> song_215 (jazz, relaxed — same L1 region)
 
 TURN 3:
-  User:   "ok now something to wake me up, really intense"
-  LLM:    sees full context + steering text --> produces H3
-  Project: H3 --> contrastive space --> song_871 (electronic, euphoric, energy: 0.9)
+  User text:     "ok now something to wake me up, really intense"
+  Prior items:   [song_042, song_215]
 
-  "wake me up" shifts the hidden state. The projection maps it to a completely different
-  region of contrastive space. No hierarchical commitment. No path dependence.
-  The jump from chill to intense is one continuous vector operation.
+  text_emb  = encode("something to wake me up, really intense")  --> HIGH ENERGY region
+  user_emb  = same
+  sys_emb   = same
+  prior     = [emb_042, emb_215]                                 --> repel from chill region
 
-RETURN TO CLIENT:
-  { id: "song_871" }
+  query = combine(text_emb, user_emb, sys_emb) + repel(emb_042, emb_215)
+  nearest neighbor --> song_871 (electronic, euphoric, energy: 0.9)
+
+RETURN TO CLIENT: { id: "song_871" }
 ```
 
-There is no quantization, no token generation for IDs, no hierarchy to commit to. The LLM reasons in language. The contrastive space resolves to items. A hard pivot ("something completely different") is just as easy as a subtle refinement ("a bit more upbeat") — both are just different directions in a continuous space.
+No hierarchy. No commitment. No path dependence. "Wake me up" just moves the query point to a different region. It's one vector operation in a continuous space. A hard pivot is exactly as easy as a subtle refinement — both are just directions.
+
+### System-Side Steering
+
+The system can inject signals at any turn, just like the user:
+
+```
+TURN 4:
+  User text:     "keep going"
+  System injects: "business rule: promote new releases this week"
+
+  sys_emb now includes encode("promote new releases this week")
+  --> query shifts toward recently-added items in the catalog
+  --> nearest neighbor prefers new items in the current region
+```
+
+User and system inputs are symmetric. Both are just embeddings in the same space. Both reshape the query.
 
 ---
 
@@ -488,102 +403,95 @@ There is no quantization, no token generation for IDs, no hierarchy to commit to
 
 ```
 Talkwalk/
-  README.md                     # Project overview, quick start, demo GIF
-  PLAN.md                       # This file
-  LICENSE                       # Apache 2.0
+  README.md
+  PLAN.md
+  LICENSE                         # Apache 2.0
 
   talkwalk/
     __init__.py
-    config.py                   # Hydra/YAML configuration
+    config.py                     # Hydra/YAML configuration
 
-    # Phase 1: Contrastive pre-training
+    # Contrastive pre-training
     contrastive/
       __init__.py
-      metadata_encoder.py       # MetadataEncoder nn.Module
-      text_encoder.py           # Text encoder wrapper
-      infonce_loss.py           # Symmetric InfoNCE implementation
-      train_contrastive.py      # Training script
-      dataset.py                # Paired (metadata, description) dataset
-      user_metadata.py          # User metadata encoding + composite profile builder
-
-    # Phase 2: Projection
-    projection/
-      __init__.py
-      projection_head.py        # LLM hidden state -> contrastive space
-      anchor_decoder.py         # Small decoder for reconstruction loss
-      losses.py                 # All 5 training losses (target, directional, reconstruct, delta, dropout)
-      train_projection.py       # Projection training script
-      steering_pairs.py         # Generate (base_context, steered_context) pairs for directional loss
+      metadata_encoder.py         # MetadataEncoder nn.Module
+      text_encoder.py             # Text encoder wrapper
+      infonce_loss.py             # Symmetric InfoNCE implementation
+      smoothing_loss.py           # Interpolation smoothing for ordered axes
+      train.py                    # Training script
+      dataset.py                  # Paired (metadata, description) dataset
+      user_metadata.py            # User metadata encoding + composite profile builder
 
     # Item index
     index/
       __init__.py
-      catalog.py                # Embed catalog, build FAISS index
-      lookup.py                 # Nearest neighbor search, real ID resolution
+      catalog.py                  # Embed catalog, build FAISS index
+      lookup.py                   # Nearest neighbor search, real ID resolution
 
     # Inference
     engine/
       __init__.py
-      recommender.py            # Main recommendation engine class
-      prompt_builder.py         # Build prompts from user metadata + context
-      session.py                # Conversation context management
+      recommender.py              # Main recommendation engine class
+      query_builder.py            # Combine user/system/prior embeddings into query
+      session.py                  # Conversation state (prior items, user metadata)
+      llm_reasoner.py             # Optional LLM for complex multi-turn reasoning
 
     # Evaluation
     eval/
       __init__.py
-      controllability.py        # Steering entropy, turns-to-satisfaction, diversity gradients
-      interpretability.py       # Embedding coherence, steering traceability
-      efficiency.py             # First-turn relevance, exploration velocity, cold-start
-      sanity.py                 # Basic accuracy, coverage, latency
-      benchmark.py              # Run full eval suite
+      controllability.py          # Steering entropy, turns-to-satisfaction, diversity gradients
+      interpretability.py         # Embedding coherence, steering traceability
+      efficiency.py               # First-turn relevance, exploration velocity, cold-start
+      sanity.py                   # Basic accuracy, coverage, latency
+      benchmark.py                # Run full eval suite
 
   # Data
   data/
     descriptions/
-      items/                    # Item metadata descriptions per key/value
+      items/
         example_music.yaml
         example_ecommerce.yaml
-      users/                    # User metadata descriptions per key/value
-        demographics.yaml       # age ranges, gender, location
-        behavior.yaml           # listening frequency, session patterns
-        context.yaml            # time of day, platform, device
-      composites/               # Combined metadata set descriptions
-        user_combinations.yaml  # e.g. age + frequency + time_of_day
-        user_item_affinity.yaml # cross-domain user-item affinity pairs
+      users/
+        demographics.yaml
+        behavior.yaml
+        context.yaml
+      composites/
+        user_combinations.yaml
+        user_item_affinity.yaml
+        interpolation_midpoints.yaml
     scripts/
-      prepare_catalog.py        # Convert raw catalog to training format
-      prepare_user_profiles.py  # Convert user data to training format
-      generate_descriptions.py  # LLM-augment descriptions for diversity
-      generate_composites.py    # Generate combined metadata descriptions
+      prepare_catalog.py
+      prepare_user_profiles.py
+      generate_descriptions.py
+      generate_composites.py
+      generate_midpoints.py       # Generate interpolation data for smoothing
 
-  # Configs
   configs/
     contrastive.yaml
-    projection.yaml
     index.yaml
+    engine.yaml
     eval.yaml
 
-  # Demo
   demo/
-    app.py                      # Gradio/Streamlit interactive demo
-    example_music.py            # Music recommendation example
-    example_ecommerce.py        # E-commerce example
+    app.py                        # Gradio interactive demo
+    example_music.py
+    example_ecommerce.py
 
   tests/
     test_contrastive.py
-    test_projection.py
     test_index.py
+    test_query_builder.py
     test_engine.py
 
   pyproject.toml
-  Makefile                      # make train-contrastive, make train-projection, etc.
+  Makefile
 ```
 
 ---
 
 ## 6. Training Data
 
-### Phase 1: Contrastive Pre-training (100K+ pairs across all metadata types)
+### Contrastive Pre-training (100K+ pairs across all metadata types)
 
 **Item metadata pairs:**
 ```json
@@ -609,20 +517,16 @@ Talkwalk/
 }
 ```
 
-Source: Catalog metadata + user profiles + human-written key descriptions + LLM-generated composites + paraphrases for augmentation.
-
-### Phase 2: Projection Training
-
-(Conversation context, target item embedding) pairs:
-
+**Interpolation midpoints:**
 ```json
 {
-  "context": "User profile: 25yo, power listener. Previously recommended: indie-rock melancholic track. User says: 'something with more energy'",
-  "target_item_embedding": [0.87, 0.33, ...]
+  "low": {"energy": 0.2, "description": "low energy, quiet, subdued"},
+  "mid": {"energy": 0.5, "description": "moderately energetic, balanced intensity"},
+  "high": {"energy": 0.8, "description": "high energy, intense, driving"}
 }
 ```
 
-Source: Historical interaction sequences reformatted as conversations, with target items embedded via the contrastive encoder from Phase 1.
+Source: Catalog metadata + user profiles + human-written key descriptions + LLM-generated composites + paraphrases for augmentation.
 
 ### Benchmark Datasets
 
@@ -636,40 +540,39 @@ Source: Historical interaction sequences reformatted as conversations, with targ
 
 ## 7. Evaluation
 
-TalkWalk's advantage is not ranking accuracy — it's controllability, interpretability, and interaction efficiency. We evaluate on those axes first, with traditional metrics as a secondary sanity check.
+TalkWalk's advantage is not ranking accuracy — it's controllability, interpretability, and interaction efficiency.
 
 ### Primary Metrics: Controllability
 
 | Metric | What It Measures | Protocol |
 |--------|-----------------|----------|
-| **Steering entropy reduction** | How much does a steering utterance narrow the output distribution? | Measure entropy of the nearest-neighbor distance distribution before and after a steering input. Higher reduction = more responsive steering. |
-| **Turns-to-satisfaction** | How many turns does a user need to reach a satisfying recommendation? | Simulated and human eval: give users a target preference, count turns until the output matches. Lower is better. |
-| **Controllable diversity gradient** | Can the user smoothly control how diverse recommendations are? | User says "more variety" / "stay close" — measure the resulting spread across outputs. Should scale proportionally to steering intensity. |
-| **Steering precision** | When a user says "more X," does X increase without unrelated attributes changing? | Measure change in target attribute vs. change in non-target attributes. High precision = surgical steering. |
-| **Steering reversibility** | Can the user undo a steer? | User steers toward X, then says "go back." Measure cosine similarity of projected hidden state to pre-steer state. |
+| **Steering entropy reduction** | How much does a steering utterance narrow the output distribution? | Measure entropy of nearest-neighbor distances before and after a steering input. Higher reduction = more responsive. |
+| **Turns-to-satisfaction** | How many turns to reach a satisfying recommendation? | Give users a target preference, count turns until output matches. Lower is better. |
+| **Controllable diversity gradient** | Can the user smoothly control diversity? | User says "more variety" / "stay close" — measure spread of outputs. Should scale proportionally. |
+| **Steering precision** | Does "more X" increase X without changing unrelated attributes? | Measure change in target vs. non-target attributes. |
+| **Steering reversibility** | Can the user undo a steer? | Steer toward X, then "go back." Measure similarity to pre-steer query. |
 
 ### Primary Metrics: Interpretability
 
 | Metric | What It Measures | Protocol |
 |--------|-----------------|----------|
-| **Embedding space coherence** | Do contrastive space regions correspond to human-understandable categories? | Cluster regions, label them via LLM, ask human raters if labels match contents. |
-| **Steering traceability** | Can you explain *why* a recommendation changed? | Given a steer + output shift, measure whether the movement in contrastive space aligns with the steering direction. |
+| **Embedding space coherence** | Do regions correspond to human-understandable categories? | Cluster, label via LLM, human raters verify. |
+| **Steering traceability** | Can you explain *why* a recommendation changed? | Measure whether query movement aligns with steering direction. |
 
 ### Primary Metrics: Interaction Efficiency
 
 | Metric | What It Measures | Protocol |
 |--------|-----------------|----------|
-| **First-turn relevance** | How good is the recommendation with zero steering? | User metadata + first prompt only. Measure user satisfaction. |
-| **Exploration velocity** | How quickly can a user traverse different regions of the catalog? | Count unique embedding-space clusters reached in N turns. |
-| **Cold-start quality** | How well does it work for a brand new user with only metadata? | Evaluate recommendations for users with no interaction history. |
+| **First-turn relevance** | How good with zero steering? | User metadata + first prompt only. |
+| **Exploration velocity** | How fast can a user traverse different catalog regions? | Count unique clusters reached in N turns. |
+| **Cold-start quality** | How well for brand new users? | Only demographic/contextual metadata, no history. |
 
-### Secondary Metrics: Sanity Checks
+### Secondary: Sanity Checks
 
-| Metric | What | Baseline |
-|--------|------|----------|
-| Nearest-neighbor accuracy | Does the top-1 result match ground truth? | > 15% |
-| Catalog coverage | % of catalog ever recommended | > 30% |
-| Latency | LLM forward pass + NN lookup | < 500ms |
+| Metric | Baseline |
+|--------|----------|
+| Catalog coverage (% ever recommended) | > 30% |
+| Latency (encode + NN lookup) | < 100ms |
 
 ---
 
@@ -680,27 +583,27 @@ TalkWalk's advantage is not ranking accuracy — it's controllability, interpret
 | Library | Purpose |
 |---------|---------|
 | PyTorch 2.x | Framework |
-| Qwen3-8B | Base LLM (frozen, no fine-tuning) |
-| Qwen3-0.6B | Lightweight item/user embedding |
 | OpenCLIP | Contrastive training framework |
 | info-nce-pytorch | InfoNCE loss |
 | FAISS | Nearest-neighbor search |
 | SentenceTransformers | Text encoding |
 | Gradio | Demo UI |
-| vLLM | Production LLM serving |
+| Qwen3-0.6B (optional) | Lightweight text encoder |
+| Qwen3-8B (optional) | LLM reasoning layer for complex multi-turn |
+| vLLM (optional) | LLM serving if using reasoning layer |
 
 ### Hardware Requirements
 
 | Phase | Minimum | Recommended |
 |-------|---------|-------------|
-| Contrastive pre-train | 1x A100 40GB | 2x A100 80GB |
-| Projection training | 1x GPU 16GB+ | 1x A100 40GB |
-| FAISS index build | CPU is fine | GPU for large catalogs |
-| Inference | 1x GPU 24GB+ (quantized LLM) | 1x A100 40GB |
+| Contrastive pre-train | 1x GPU 16GB+ | 1x A100 40GB |
+| FAISS index build | CPU | GPU for large catalogs |
+| Inference (no LLM) | CPU | GPU for low latency |
+| Inference (with LLM) | 1x GPU 24GB+ | 1x A100 40GB |
 
 ### Budget option
-- Quantized Qwen3-8B (4-bit) on 1x RTX 3090/4090
-- Phi-3 (3.8B) instead of Qwen3-8B — half the VRAM, 2x faster
+- Contrastive training on 1x RTX 3090/4090
+- Inference without LLM runs on CPU — the encoders are small
 
 ---
 
@@ -717,31 +620,30 @@ TalkWalk's advantage is not ranking accuracy — it's controllability, interpret
 - [ ] Write MetadataEncoder
 - [ ] Write paired dataset loader (items, users, composites, cross-domain)
 - [ ] Implement symmetric InfoNCE training loop
-- [ ] Add interpolation smoothing loss for ordered metadata axes (energy, tempo, price, etc.)
+- [ ] Add interpolation smoothing loss for ordered metadata axes
 - [ ] Write human language descriptions for chosen domain (items + users + combinations)
 - [ ] Generate midpoint descriptions for smoothing
-- [ ] Train and validate: verify that similar items/users cluster together AND gradients are smooth
-- [ ] Visualize embedding space (t-SNE/UMAP) — check for continuity, not just clusters
+- [ ] Train and validate: verify clustering AND gradient smoothness
+- [ ] Visualize embedding space (t-SNE/UMAP)
 
-### Phase 2: Projection + Index (Weeks 4-5)
-- [ ] Embed full catalog into contrastive space, build FAISS index
-- [ ] Generate steering pairs for directional loss
-- [ ] Generate conversation delta pairs for turn-transition loss
-- [ ] Train projection head with all 5 losses (target + directional + reconstruction + delta + context dropout)
-- [ ] Validate: directional steering (does "more energetic" move the right direction?)
-- [ ] Validate: given a conversation, does the projected hidden state land near the right items?
-
-### Phase 3: Inference Engine (Week 5)
-- [ ] Build prompt construction from user metadata + conversation context
-- [ ] Implement LLM -> projection -> nearest neighbor pipeline
-- [ ] Build session management
+### Phase 2: Index + Query Engine (Week 4)
+- [ ] Embed full catalog into contrastive space
+- [ ] Build FAISS index
+- [ ] Implement query combination (user text + user meta + system context + prior items)
+- [ ] Implement attract/repel for prior items
 - [ ] End-to-end test: text in, item ID out
 
-### Phase 4: Evaluation and Demo (Weeks 6-7)
+### Phase 3: Evaluation and Demo (Weeks 5-6)
 - [ ] Run full eval suite (controllability + interpretability + efficiency)
 - [ ] Build Gradio demo with interactive steering
 - [ ] Record demo GIF/video for README
 - [ ] Write blog post explaining the architecture
+
+### Phase 4: Optional LLM Reasoning Layer (Week 7)
+- [ ] Add LLM preprocessor for complex multi-turn conversations
+- [ ] LLM generates text description -> text encoder -> same contrastive space
+- [ ] Compare eval results with and without LLM layer
+- [ ] Document when the LLM helps vs. when pure embedding is sufficient
 
 ---
 
@@ -752,10 +654,9 @@ TalkWalk's advantage is not ranking accuracy — it's controllability, interpret
 | OpenCLIP | https://github.com/mlfoundations/open_clip |
 | info-nce-pytorch | https://github.com/RElbers/info-nce-pytorch |
 | FAISS | https://github.com/facebookresearch/faiss |
-| REGEN dataset (Google) | https://www.kaggle.com/datasets/googleai/regen-reviews-enhanced-with-generative-narratives |
-| SteerEval | https://arxiv.org/abs/2601.21105 |
-| Spotify Text2Tracks | https://research.atspotify.com/2025/04/text2tracks-improving-prompt-based-music-recommendations-with-generative-retrieval |
-| REGEN/LUMEN (Google) | https://arxiv.org/abs/2503.11924 |
-| TIGER paper (NeurIPS 2023) | https://papers.neurips.cc/paper_files/paper/2023/file/20dcab0f14046a5c6b02b61da9f13229-Paper-Conference.pdf |
 | CLIP (OpenAI) | https://arxiv.org/abs/2103.00020 |
 | LLM2CLIP | https://arxiv.org/pdf/2411.04997 |
+| REGEN dataset (Google) | https://www.kaggle.com/datasets/googleai/regen-reviews-enhanced-with-generative-narratives |
+| REGEN/LUMEN (Google) | https://arxiv.org/abs/2503.11924 |
+| SteerEval | https://arxiv.org/abs/2601.21105 |
+| Spotify Text2Tracks | https://research.atspotify.com/2025/04/text2tracks-improving-prompt-based-music-recommendations-with-generative-retrieval |
