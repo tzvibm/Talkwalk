@@ -1,6 +1,6 @@
 # TalkWalk — Steerable Recommendation Engine
 
-> A novel open-source recommendation engine where users can change the algorithm with plain English, in real-time. Like Spotify's AI DJ, but generalized for any domain.
+> An open-source recommendation engine where users can change the algorithm with plain English, in real-time. Like Spotify's AI DJ, but generalized for any domain.
 
 ---
 
@@ -16,6 +16,7 @@
 8. [Evaluation](#8-evaluation)
 9. [Hardware and Dependencies](#9-hardware-and-dependencies)
 10. [Implementation Roadmap](#10-implementation-roadmap)
+11. [References](#11-references)
 
 ---
 
@@ -23,23 +24,22 @@
 
 Traditional recommendation systems treat language and items as separate worlds — the user speaks English, a pipeline translates that into filters and queries, and a separate model ranks results. The user has no real control over *how* the algorithm thinks.
 
-**TalkWalk unifies language and items inside a single model.** When a user says "something chill," it doesn't trigger a filter — it directly shifts the probability distribution over items toward low-energy, relaxed content. The words *are* the algorithm.
-
-### What makes this innovative
+TalkWalk unifies language and items inside a single model. When a user says "something chill," it doesn't trigger a filter — it directly shifts the probability distribution over items toward low-energy, relaxed content. The words *are* the algorithm.
 
 | | Traditional Recommenders | TalkWalk |
 |---|---|---|
 | **Steering** | Filters, sliders, thumbs up/down | Plain English changes inference path in real-time |
-| **Architecture** | Pipeline of separate components (retrieval -> ranking -> re-ranking) | Single unified model — the LLM *is* the recommender |
+| **Architecture** | Pipeline of separate components (retrieval, ranking, re-ranking) | Single unified model — the LLM *is* the recommender |
 | **Item understanding** | Collaborative filtering on interaction history | Contrastively trained on metadata — understands what items *are* |
-| **Cold start** | Needs interaction history | Metadata alone is enough — new items work immediately |
+| **User understanding** | Demographic buckets, sparse features | User metadata contrastively trained with language descriptions — understands who users *are* |
+| **Cold start** | Needs interaction history | Metadata alone is enough — new items and new users work immediately |
 | **Latency** | Multiple model calls + database queries | One forward pass |
 | **Scalability** | Item IDs grow linearly with catalog | Semantic IDs = fixed vocabulary for millions of items |
-| **State** | Stateless or shallow session tracking | Deep stateful traversal — the model sees the full arc of exploration |
+| **State** | Stateless or shallow session tracking | Implicit — the conversation context *is* the traversal |
 
 ### The core insight
 
-By contrastively training metadata descriptions into the LLM's embedding space, and representing items as hierarchical semantic tokens in the LLM's vocabulary, we create a system where **human language and item identity exist in the same space**. Steering the algorithm is as natural as talking to it.
+By contrastively training metadata descriptions — for both items and users — into the LLM's embedding space, and representing items as hierarchical semantic tokens in the LLM's vocabulary, we create a system where human language, user identity, and item identity all exist in the same space. Steering the algorithm is as natural as talking to it. And because the LLM already understands language sequencing, no fine-tuning is needed beyond aligning the new token embeddings.
 
 ---
 
@@ -56,19 +56,21 @@ Human Language  <-- contrastive -->  Metadata  <-- quantization -->  Semantic ID
 ### Training Pipeline
 
 ```
-Phase 1                    Phase 2                  Phase 3
-Contrastive Pre-train  --> Semantic ID          --> LLM Fine-tuning
-(metadata <-> text)        Tokenization             (SFT + optional RL)
-OpenCLIP + InfoNCE         RQ-VAE via GRID          Qwen3-8B via Unsloth
+Phase 1                       Phase 2                    Phase 3
+Contrastive Pre-training  --> Semantic ID            --> Embedding Alignment
+(item metadata <-> text)      Tokenization               (new tokens into LLM vocab)
+(user metadata <-> text)      (RQ-VAE via GRID)          (~1K steps, embeddings only)
+(composites   <-> text)
+OpenCLIP + InfoNCE                                       Qwen3-8B + Unsloth
 ```
 
 ### Inference Pipeline
 
 ```
-User input + user metadata + traversal state
+User input + user metadata
     |
     v
-Build prompt (natural language + semantic ID history)
+Conversation context (already contains all prior semantic IDs + steering)
     |
     v
 LLM forward pass with constrained decoding (Outlines)
@@ -77,18 +79,29 @@ LLM forward pass with constrained decoding (Outlines)
 Output: <L1_X><L2_Y><L3_Z>  -->  Lookup table  -->  real object ID
     |
     v
-Update traversal state (append to session context)
-    |
-    v
 Return object ID to client
 ```
+
+There is no separate "traversal state" to manage. The LLM's context window already contains the full history of generated semantic IDs, user steering messages, and prior recommendations. In an autoregressive model, the probability distribution over the next token is already the product of every prior token. The conversation context *is* the traversal. The distribution space *is* the state.
+
+### The Key Principle: Everything Reshapes the Distribution
+
+At every point during inference, the probability distribution over the next semantic ID token is shaped by **everything in the context**:
+
+- **User-provided English** — "something chill," "more like that," "wake me up" — each phrase shifts the distribution in real-time
+- **System-provided user metadata embeddings** — the user's age, platform, time of day, listening history — injected into the prompt, these bias the distribution toward regions of item-space that match the user's profile
+- **System-provided contextual embeddings** — session context, domain rules, business constraints — further shape what the model considers likely
+- **Prior semantic IDs in the conversation** — every previously generated recommendation is in the context window, pulling the distribution toward or away from similar items
+
+There is no distinction between "the algorithm" and "the inputs." The distribution space *is* the algorithm, and every signal — user or system, language or embedding — continuously reshapes it. This is what makes TalkWalk fundamentally different: the recommendation algorithm is not a fixed function that takes inputs; it is a living distribution that every participant (user, system, context) is constantly sculpting.
 
 ### What Makes This Novel
 
 1. **The LLM *is* the recommender** — no tool chain, no external ranker, no SQL queries
-2. **Plain English changes the algorithm** — "something chill" literally shifts token probabilities toward low-energy items
-3. **Stateful traversal** — accumulated navigation context feeds back into each recommendation
-4. **Domain-agnostic** — works for music, products, movies, articles — anything with metadata
+2. **Every input changes the algorithm** — user English, system metadata, prior outputs — all continuously reshape the distribution space over items
+3. **Traversal is implicit** — the distribution space is already a product of everything the user has navigated; no separate state management needed
+4. **No fine-tuning needed** — the LLM already understands language; we only align new token embeddings into its existing space
+5. **Domain-agnostic** — works for music, products, movies, articles — anything with metadata
 
 ---
 
@@ -96,7 +109,7 @@ Return object ID to client
 
 ### 3.1 Phase 1: Contrastive Pre-training (Metadata <-> Text)
 
-**Goal:** Teach the model that structured metadata and human language descriptions mean the same thing.
+**Goal:** Teach the model that structured metadata and human language descriptions mean the same thing — for items, users, and their combinations.
 
 **Architecture:** CLIP-style dual encoder with InfoNCE loss.
 
@@ -104,7 +117,7 @@ Return object ID to client
 # Encoder A: Text (pre-trained, frozen initially)
 text_encoder = SentenceTransformer("all-MiniLM-L6-v2")  # or Qwen3-0.6B
 
-# Encoder B: Metadata (learned from scratch)
+# Encoder B: Metadata (learned from scratch — shared across item and user metadata)
 class MetadataEncoder(nn.Module):
     def __init__(self, metadata_dim, embed_dim):
         self.encoder = nn.Sequential(
@@ -122,7 +135,9 @@ class MetadataEncoder(nn.Module):
 # - Minimize off-diagonal (mismatched pairs)
 ```
 
-**You provide:** Human language descriptions per metadata key/value (the "language bridge").
+#### Item Metadata Descriptions
+
+Human language descriptions per metadata key/value — the "language bridge":
 
 ```yaml
 genre:
@@ -139,11 +154,90 @@ energy:
   0.7-1.0: "high energy, intense, driving"
 ```
 
-Descriptions for each object are assembled by combining per-key descriptions. Augmented with LLM-generated paraphrases for diversity.
+#### User Metadata Descriptions
+
+Every user attribute gets the same treatment — human language descriptions so the model understands *who* it's recommending to, not just *what* to recommend:
+
+```yaml
+age_range:
+  13-17: "teenager, discovering tastes, trend-sensitive"
+  18-24: "young adult, exploratory, open to new genres"
+  25-34: "established preferences but still adventurous"
+  35-49: "mature taste, values quality over novelty"
+  50+: "deep knowledge of classics, selective discovery"
+
+listening_frequency:
+  casual: "listens occasionally, background music"
+  regular: "daily listener, curated playlists"
+  power: "music is central to life, constantly exploring"
+
+platform:
+  mobile: "on the go, shorter sessions, needs energy-aware recs"
+  desktop: "focused listening sessions, deeper exploration"
+  smart_speaker: "ambient, social setting, mood-driven"
+
+time_of_day:
+  morning: "waking up, needs energy ramp, fresh start"
+  afternoon: "focused or working, steady rhythm"
+  evening: "winding down, reflective, social"
+  late_night: "introspective, deep cuts, experimental"
+```
+
+#### Combined Metadata Sets (Composite Descriptions)
+
+The real power is in combinations. Individual metadata values are useful, but behavior emerges from intersections. We train on composite descriptions that capture the *meaning* of metadata combinations:
+
+```yaml
+age_range=18-24 + listening_frequency=power:
+  "young music obsessive, constantly seeking the next underground hit,
+   thrives on discovery and genre-blending"
+
+age_range=35-49 + listening_frequency=casual:
+  "knows what they like, low patience for misses,
+   recommend proven quality not experiments"
+
+age_range=18-24 + time_of_day=late_night:
+  "late night young adult — experimental, introspective,
+   open to ambient, lo-fi, or deep electronic"
+
+age_range=50+ + platform=smart_speaker + time_of_day=morning:
+  "older listener, morning routine, smart speaker —
+   familiar comfort, jazz or classical, moderate energy"
+```
+
+#### Cross-Domain Training (User x Item)
+
+We also train contrastively on user-item affinity descriptions — teaching the model that certain user profiles naturally align with certain item profiles:
+
+```yaml
+user={age: 18-24, freq: power, time: late_night} + item={genre: ambient, energy: 0.2}:
+  "young night owl deep-listening to atmospheric ambient — high affinity"
+
+user={age: 35-49, freq: casual} + item={genre: experimental-noise, energy: 0.9}:
+  "mature casual listener vs harsh experimental — low affinity, avoid unless requested"
+```
+
+This means when the model sees a user profile at inference time, it already knows which regions of item-space are natural fits — and which require an explicit steering request to reach.
+
+#### Training Strategy
+
+All metadata types are trained together in the same contrastive embedding space:
+
+```
+Item metadata      <-- contrastive -->  Item descriptions
+User metadata      <-- contrastive -->  User descriptions
+Combined metadata  <-- contrastive -->  Composite descriptions
+User x Item pairs  <-- contrastive -->  Affinity descriptions
+```
+
+This creates a unified embedding space where:
+- "18-24 year old power listener" is *near* "experimental, high-discovery items"
+- "50+ casual morning listener" is *near* "familiar, moderate-energy classics"
+- Plain English steering ("show me something weird") moves through the same space
 
 **Libraries:** OpenCLIP (with MetadataEncoder replacing vision tower) + info-nce-pytorch
 
-**Output:** Dense embeddings where language and metadata live in the same vector space.
+**Output:** Dense embeddings where item metadata, user metadata, combined profiles, and natural language all live in the same vector space.
 
 ---
 
@@ -182,13 +276,13 @@ song_215 --> (12, 44, 203)  --> <L1_12><L2_44><L3_203>
 
 ---
 
-### 3.3 Phase 3: LLM Fine-tuning
+### 3.3 Phase 3: Embedding Alignment
 
-**Goal:** Teach the LLM to (a) understand semantic ID tokens, (b) generate valid recommendations, (c) follow natural language steering.
+**Goal:** Integrate semantic ID tokens into an LLM that already understands language sequencing.
+
+The LLM is already trained on language. It already understands "chill," "intense," "something like that but different." We don't need to teach it language or sequencing — we only need to teach it what the new tokens mean. The contrastive pre-training (Phase 1) already aligned metadata and language in the same embedding space. Phase 3 is just connecting those embeddings to the LLM's vocabulary.
 
 **Base model:** Qwen3-8B
-
-Why Qwen3-8B:
 - Best embedding quality at 7-8B size
 - Proven with semantic IDs (Eugene Yan's semantic-ids-llm)
 - Apache 2.0 / permissive license
@@ -199,26 +293,27 @@ Why Qwen3-8B:
 - 3 special tokens: `<|rec|>`, `<|sid_start|>`, `<|sid_end|>`
 - 768 semantic ID tokens: `<|L1_0|>` ... `<|L1_255|>`, `<|L2_0|>` ... `<|L2_255|>`, `<|L3_0|>` ... `<|L3_255|>`
 
-**Two-stage fine-tuning:**
+**Why full fine-tuning is not needed:**
 
-**Stage A — Embedding warm-up (1,000 steps):**
-- Freeze ALL parameters except input/output embedding layers
-- High LR (1e-3) to quickly learn new token embeddings
-- New embeddings initialized to mean of existing embeddings
-- Batch size 32, cosine annealing, 100 step warmup
+The LLM already knows how to understand natural language, sequence tokens autoregressively, and maintain context across a conversation. All we need is for the new semantic ID token embeddings to land in the right place in the model's embedding space — close to the language concepts they represent. This is an embedding alignment problem, not a behavioral fine-tuning problem.
 
-**Stage B — Full fine-tune (3 epochs):**
-- Unfreeze all parameters
-- Conservative LR (2e-5), effective batch size 128
-- LoRA or full fine-tune depending on hardware
-- 3% warmup, weight decay 0.01, gradient clipping 1.0
-- Mixed precision (bf16 on A100/H100, fp16 otherwise)
+**Embedding-only training:**
+- Freeze ALL model parameters except input/output embedding layers
+- Initialize new token embeddings from the contrastive pre-trained metadata encoder (not random — the embeddings already encode the right semantics)
+- Train for ~1,000 steps to align new embeddings with the LLM's internal representation space
+- High LR (1e-3), batch size 32, cosine annealing, 100 step warmup
+
+The model already speaks English. Now it also speaks semantic IDs — because those IDs were contrastively trained to mean the same thing as the English descriptions.
+
+**Optional fallback (only if embedding-only underperforms):**
+- Light LoRA fine-tune on recommendation conversations
+- Conservative LR (2e-5), 1-2 epochs max
 
 ---
 
-## 4. Inference Flow (Concrete Example)
+## 4. Inference Flow
 
-### The Data
+### Example Catalog
 
 ```
 song_042: {genre: "indie-rock", mood: "melancholic", energy: 0.3}  --> <L1_12><L2_187><L3_45>
@@ -226,50 +321,45 @@ song_871: {genre: "electronic", mood: "euphoric", energy: 0.9}     --> <L1_88><L
 song_215: {genre: "jazz", mood: "relaxed", energy: 0.2}            --> <L1_12><L2_44><L3_203>
 ```
 
-### Step-by-step
+### Multi-Turn Conversation
 
 ```
-USER SESSION STATE:
-  User metadata:    {age: 25, likes: [indie]}
-  Traversal state:  [song_042, song_215]   (both chill, low energy)
-  User says:        "ok now something to wake me up, really intense"
-                           |
-                           v
-PROMPT CONSTRUCTED:
-  "User profile: 25yo, prefers indie.
-   History: <|sid_start|><|L1_12|><|L2_187|><|L3_45|><|sid_end|>,
-            <|sid_start|><|L1_12|><|L2_44|><|L3_203|><|sid_end|>
-   Pattern: low-energy, reflective tracks.
-   User request: 'something to wake me up, really intense'
-   Recommend next:"
-                           |
-                           v
-LLM GENERATES (with constrained decoding):
-  "wake me up" activates HIGH ENERGY regions of embedding space
-  --> high probability on <L1_88> (high-energy cluster)
+TURN 1:
+  System: "User profile: 25yo, prefers indie."
+  User:   "Recommend something"
+  Model:  <|sid_start|><|L1_12|><|L2_187|><|L3_45|><|sid_end|>  --> song_042 (indie, melancholic)
 
-  Output: <|sid_start|><|L1_88|><|L2_302|><|L3_91|><|sid_end|>
-                           |
-                           v
+TURN 2:
+  User:   "More like that"
+  Model:  <|sid_start|><|L1_12|><|L2_44|><|L3_203|><|sid_end|>  --> song_215 (jazz, relaxed)
+
+  The context already contains <L1_12><L2_187><L3_45> from turn 1.
+  The distribution is already biased toward the L1_12 region (chill, low-energy).
+  The prior output IS the state.
+
+TURN 3:
+  User:   "ok now something to wake me up, really intense"
+  Model:  <|sid_start|><|L1_88|><|L2_302|><|L3_91|><|sid_end|>  --> song_871 (electronic, euphoric)
+
+  "wake me up" activates HIGH ENERGY regions of embedding space.
+  The model sees two prior chill recommendations in context AND the steering text.
+  The distribution shifts from L1_12 (chill) to L1_88 (high-energy) in one pass.
+  The entire traversal (chill -> chill -> PIVOT) is visible in the context window.
+
 LOOKUP:
-  (88, 302, 91) --> song_871  (electronic, euphoric, energy: 0.9)
-                           |
-                           v
-UPDATE TRAVERSAL:
-  State: [song_042, song_215, song_871]
-  Trajectory: chill -> chill -> HIGH ENERGY (pivot detected)
-  This feeds into the NEXT recommendation
-                           |
-                           v
+  (88, 302, 91) --> song_871
+
 RETURN TO CLIENT:
-  { id: "song_871", explanation: "High-energy electronic track to wake you up" }
+  { id: "song_871" }
 ```
+
+In an autoregressive model, the probability distribution over the next token is already the product of every prior token. The traversal history — prior semantic IDs and user steering — shapes the distribution automatically. There is nothing to "update." The context window is the state. The distribution space is the traversal.
 
 ---
 
 ## 5. Constrained Decoding
 
-**Problem:** The LLM might generate semantic ID tokens in wrong order or produce invalid combinations.
+**Problem:** The LLM might generate semantic ID tokens in the wrong order or produce invalid combinations.
 
 **Solution:** Level-separated token namespaces + grammar-constrained generation via Outlines.
 
@@ -280,7 +370,7 @@ Level 2 (medium):  <|L2_0|> through <|L2_255|>
 Level 3 (fine):    <|L3_0|> through <|L3_255|>
 ```
 
-At inference, Outlines enforces this grammar:
+At inference, Outlines enforces the grammar:
 ```
 Position 1: ONLY allow <|L1_*|> tokens   (256 options)
 Position 2: ONLY allow <|L2_*|> tokens   (256 options)
@@ -298,9 +388,9 @@ sid_regex = f"<\\|sid_start\\|>({L1})({L2})({L3})<\\|sid_end\\|>"
 generator = outlines.generate.regex(model, sid_regex)
 ```
 
-The model **cannot** produce tokens out of order. Invalid sequences are impossible.
+The model cannot produce tokens out of order. Invalid sequences are impossible.
 
-For hallucinated but valid-format IDs (a tuple that maps to no real object), use constrained decoding that only allows tokens forming valid prefixes in the codebook.
+For hallucinated but structurally valid IDs (a tuple that maps to no real object), constrain decoding further to only allow tokens forming valid prefixes in the codebook.
 
 ---
 
@@ -320,10 +410,11 @@ Talkwalk/
     contrastive/
       __init__.py
       metadata_encoder.py       # MetadataEncoder nn.Module
-      text_encoder.py           # Text encoder wrapper (SentenceTransformers/Qwen3-0.6B)
+      text_encoder.py           # Text encoder wrapper
       infonce_loss.py           # Symmetric InfoNCE implementation
       train_contrastive.py      # Training script
       dataset.py                # Paired (metadata, description) dataset
+      user_metadata.py          # User metadata encoding + composite profile builder
 
     # Phase 2: Semantic ID tokenization
     tokenizer/
@@ -332,22 +423,19 @@ Talkwalk/
       codebook.py               # Codebook management, ID assignment
       lookup.py                 # Semantic ID <-> real ID lookup table
 
-    # Phase 3: LLM fine-tuning
+    # Phase 3: Embedding alignment
     model/
       __init__.py
       vocab_extension.py        # Add semantic ID tokens to LLM vocab
-      train_embeddings.py       # Stage A: embedding warm-up
-      train_full.py             # Stage B: full SFT fine-tune
-      train_dpo.py              # Optional: DPO/RL alignment
+      train_embeddings.py       # Embedding-only alignment training
 
     # Inference
     engine/
       __init__.py
       recommender.py            # Main recommendation engine class
-      prompt_builder.py         # Build prompts from user/traversal state
+      prompt_builder.py         # Build prompts from user metadata + context
       constrained_decode.py     # Outlines grammar for semantic IDs
-      traversal.py              # Stateful traversal manager
-      session.py                # User session management
+      session.py                # Conversation context management
 
     # Evaluation
     eval/
@@ -357,16 +445,24 @@ Talkwalk/
       hierarchical.py           # L1/L2/L3 accuracy
       benchmark.py              # Run full eval suite
 
-  # Data processing
+  # Data
   data/
-    descriptions/               # Human language descriptions per metadata key
-      example_music.yaml
-      example_ecommerce.yaml
+    descriptions/
+      items/                    # Item metadata descriptions per key/value
+        example_music.yaml
+        example_ecommerce.yaml
+      users/                    # User metadata descriptions per key/value
+        demographics.yaml       # age ranges, gender, location
+        behavior.yaml           # listening frequency, session patterns
+        context.yaml            # time of day, platform, device
+      composites/               # Combined metadata set descriptions
+        user_combinations.yaml  # e.g. age + frequency + time_of_day
+        user_item_affinity.yaml # cross-domain user-item affinity pairs
     scripts/
       prepare_catalog.py        # Convert raw catalog to training format
+      prepare_user_profiles.py  # Convert user data to training format
       generate_descriptions.py  # LLM-augment descriptions for diversity
-      build_sft_data.py         # Generate SFT chat conversations
-      build_dpo_data.py         # Generate preference pairs
+      generate_composites.py    # Generate combined metadata descriptions
 
   # Configs
   configs/
@@ -396,8 +492,9 @@ Talkwalk/
 
 ## 7. Training Data
 
-### Phase 1: Contrastive Pre-training (100K+ pairs)
+### Phase 1: Contrastive Pre-training (100K+ pairs across all metadata types)
 
+**Item metadata pairs:**
 ```json
 {
   "metadata": {"genre": "indie-rock", "tempo": 128, "mood": "melancholic", "energy": 0.3},
@@ -405,41 +502,37 @@ Talkwalk/
 }
 ```
 
-Source: Catalog metadata + human-written key descriptions + LLM paraphrases for augmentation.
-
-### Phase 2: SFT Fine-tuning (50-100K conversations)
-
-**Next-item prediction:**
-```
-User: History: [items with semantic IDs]. What next?
-Assistant: I recommend <|sid_start|><|L1_42|><|L2_201|><|L3_67|><|sid_end|> because...
-```
-
-**Steered recommendation:**
-```
-User: History: [items]. Give me something with more energy.
-Assistant: <|sid_start|><|L1_88|><|L2_302|><|L3_91|><|sid_end|> — high-energy electronic track...
-```
-
-**Explanation:**
-```
-User: Why did you recommend that?
-Assistant: It shares L1 category 42 (premium audio) with your history...
-```
-
-Source: Historical interaction sequences + synthetic generation.
-
-### Phase 3: DPO Alignment (20-50K preference pairs, optional)
-
+**User metadata pairs:**
 ```json
 {
-  "prompt": "History: [items]. Recommend a gift under $100.",
-  "chosen": "<|sid_start|>...<|sid_end|> — matches budget, great gift.",
-  "rejected": "<|sid_start|>...<|sid_end|> — repeats history, ignores constraint."
+  "metadata": {"age_range": "18-24", "listening_frequency": "power", "time_of_day": "late_night"},
+  "description": "young music obsessive, late night deep listening, experimental and introspective"
 }
 ```
 
-### Benchmark Datasets to Start With
+**Combined/composite pairs:**
+```json
+{
+  "metadata": {"user": {"age": "18-24", "freq": "power"}, "item": {"genre": "ambient", "energy": 0.2}},
+  "description": "young power listener exploring atmospheric ambient — high affinity, discovery mode"
+}
+```
+
+Source: Catalog metadata + user profiles + human-written key descriptions + LLM-generated composites + paraphrases for augmentation.
+
+### Phase 2: Embedding Alignment (~1K steps)
+
+Short examples pairing semantic IDs with their natural language descriptions, so the new token embeddings land in the right place in the LLM's space:
+
+```
+"indie-rock, melancholic, low energy" --> <|sid_start|><|L1_12|><|L2_187|><|L3_45|><|sid_end|>
+"electronic, euphoric, high energy"   --> <|sid_start|><|L1_88|><|L2_302|><|L3_91|><|sid_end|>
+"jazz, relaxed, very low energy"      --> <|sid_start|><|L1_12|><|L2_44|><|L3_203|><|sid_end|>
+```
+
+Source: Catalog items with their contrastive descriptions mapped to assigned semantic IDs.
+
+### Benchmark Datasets
 
 | Dataset | Items | Domain | Why |
 |---------|-------|--------|-----|
@@ -451,7 +544,7 @@ Source: Historical interaction sequences + synthetic generation.
 
 ## 8. Evaluation
 
-### Ranking Metrics (offline)
+### Ranking Metrics
 
 | Metric | What It Measures | Target |
 |--------|-----------------|--------|
@@ -459,7 +552,7 @@ Source: Historical interaction sequences + synthetic generation.
 | NDCG@10 | Ranking quality weighted by position | > 0.15 |
 | MRR | Avg 1/rank of first relevant item | > 0.10 |
 
-### Hierarchical Accuracy (semantic-ID specific)
+### Hierarchical Accuracy
 
 | Metric | Target |
 |--------|--------|
@@ -496,8 +589,8 @@ Source: Historical interaction sequences + synthetic generation.
 |---------|---------|
 | PyTorch 2.x | Framework |
 | Qwen3-8B | Base LLM |
-| Qwen3-0.6B | Lightweight item embedding |
-| Unsloth | Efficient fine-tuning |
+| Qwen3-0.6B | Lightweight item/user embedding |
+| Unsloth | Efficient embedding alignment |
 | GRID (snap-research) | Semantic ID tokenization (RQ-VAE / RK-Means) |
 | OpenCLIP | Contrastive training framework |
 | info-nce-pytorch | InfoNCE loss |
@@ -511,13 +604,12 @@ Source: Historical interaction sequences + synthetic generation.
 | Phase | Minimum | Recommended |
 |-------|---------|-------------|
 | Contrastive pre-train | 1x A100 40GB | 2x A100 80GB |
-| RQ-VAE tokenization | 1x GPU (any) | CPU is fine |
-| LLM fine-tune (LoRA) | 1x A100 40GB (16GB with QLoRA) | 2x A100 80GB |
-| LLM fine-tune (full) | 4x A100 80GB | 8x A100 80GB |
-| Inference | 1x A100 40GB | 1x A100 80GB (or quantized on smaller) |
+| RQ-VAE tokenization | CPU is fine | 1x GPU (any) |
+| Embedding alignment | 1x GPU 16GB+ | 1x A100 40GB |
+| Inference | 1x GPU 24GB+ (quantized) | 1x A100 40GB |
 
 ### Budget option
-- QLoRA fine-tune on 1x RTX 4090 (24GB) or even 1x RTX 3090
+- Embedding alignment on 1x RTX 3090/4090 (24GB)
 - Phi-3 (3.8B) instead of Qwen3-8B — half the VRAM, 2x faster, slight quality loss
 
 ---
@@ -533,44 +625,42 @@ Source: Historical interaction sequences + synthetic generation.
 
 ### Phase 1: Contrastive Pre-training (Weeks 2-3)
 - [ ] Write MetadataEncoder
-- [ ] Write paired dataset loader
+- [ ] Write paired dataset loader (items, users, composites, cross-domain)
 - [ ] Implement symmetric InfoNCE training loop
-- [ ] Write human language descriptions for chosen domain
-- [ ] Train and validate: verify that similar items cluster together in embedding space
+- [ ] Write human language descriptions for chosen domain (items + users + combinations)
+- [ ] Train and validate: verify that similar items/users cluster together
 - [ ] Visualize embedding space (t-SNE/UMAP)
 
 ### Phase 2: Semantic ID Tokenization (Week 4)
 - [ ] Integrate GRID or implement standalone RQ-VAE
 - [ ] Train codebooks on contrastive embeddings
 - [ ] Assign semantic IDs to full catalog
-- [ ] Build and validate lookup table (SID -> real ID, real ID -> SID)
+- [ ] Build and validate lookup table (SID <-> real ID)
 - [ ] Verify: similar items share L1 prefixes
 
-### Phase 3: LLM Fine-tuning (Weeks 5-7)
-- [ ] Generate SFT training data (next-item + steered + explanation)
+### Phase 3: Embedding Alignment (Week 5)
 - [ ] Extend Qwen3-8B vocabulary with semantic ID tokens
-- [ ] Stage A: embedding warm-up (1K steps)
-- [ ] Stage B: full SFT fine-tune (3 epochs)
+- [ ] Initialize new embeddings from contrastive pre-trained encoder
+- [ ] Embedding-only training (~1K steps, freeze all other params)
 - [ ] Validate: L1/L2/L3 accuracy, Hit@10, NDCG@10
-- [ ] Optional: DPO alignment on preference pairs
+- [ ] If underperforms: light LoRA as fallback
 
-### Phase 4: Inference Engine (Week 8)
+### Phase 4: Inference Engine (Week 6)
 - [ ] Implement constrained decoding with Outlines
-- [ ] Build prompt construction from user/traversal state
-- [ ] Implement stateful traversal manager
+- [ ] Build prompt construction from user metadata + conversation context
 - [ ] Build session management
-- [ ] End-to-end test: text in -> object ID out
+- [ ] End-to-end test: text in, object ID out
 
-### Phase 5: Evaluation and Demo (Weeks 9-10)
+### Phase 5: Evaluation and Demo (Weeks 7-8)
 - [ ] Run full eval suite (ranking + steerability + diversity)
 - [ ] Build Gradio demo with interactive steering
 - [ ] Record demo GIF/video for README
 - [ ] Write blog post explaining the architecture
-- [ ] Benchmark against baselines (SASRec, RecAI if possible)
+- [ ] Benchmark against baselines
 
 ---
 
-## References
+## 11. References
 
 | Resource | URL |
 |----------|-----|
@@ -585,5 +675,4 @@ Source: Historical interaction sequences + synthetic generation.
 | TIGER paper (NeurIPS 2023) | https://papers.neurips.cc/paper_files/paper/2023/file/20dcab0f14046a5c6b02b61da9f13229-Paper-Conference.pdf |
 | Spotify Semantic IDs | https://research.atspotify.com/2025/9/semantic-ids-for-generative-search-and-recommendation |
 | Spotify Text2Tracks | https://research.atspotify.com/2025/04/text2tracks-improving-prompt-based-music-recommendations-with-generative-retrieval |
-| Microsoft RecAI | https://github.com/microsoft/RecAI |
 | REGEN/LUMEN (Google) | https://arxiv.org/abs/2503.11924 |
